@@ -5,11 +5,13 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
 <meta name="theme-color" content="#1A3C2E"/>
 <meta name="apple-mobile-web-app-capable" content="yes"/>
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
 <meta name="description" content="Personal Quran Hifdh review tracker"/>
 <title>مُتابَعَةُ الحِفْظِ</title>
 <link rel="manifest" href="manifest.json"/>
 <link rel="icon" href="icon-192.png"/>
+<!-- Firebase SDKs (CDN — no npm install needed) -->
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-messaging-compat.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=Lora:ital,wght@0,400;0,600;1,400&display=swap');
 *{box-sizing:border-box;margin:0;padding:0;}
@@ -72,13 +74,13 @@ select,input[type=text]{width:100%;border:1px solid var(--border);border-radius:
 .progress-bar-fill{background:linear-gradient(90deg,#F0B429,#2ECC71);height:5px;border-radius:3px;transition:width .5s;}
 .prep-bar-done{height:6px;flex:1;border-radius:3px;background:#F0B429;box-shadow:0 0 4px rgba(240,180,41,.5);}
 .prep-bar-empty{height:6px;flex:1;border-radius:3px;background:rgba(255,255,255,.18);}
-.tahajjud-bar-done{height:8px;width:22px;border-radius:3px;margin-left:5px;background:#F0B429;border:1px solid rgba(240,180,41,.5);flex-shrink:0;box-shadow:0 0 5px rgba(240,180,41,.45);}
+.tahajjud-bar-done{height:8px;width:22px;border-radius:3px;margin-left:5px;background:#F0B429;border:1px solid rgba(240,180,41,.5);flex-shrink:0;}
 .tahajjud-bar-empty{height:8px;width:22px;border-radius:3px;margin-left:5px;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.2);flex-shrink:0;}
-/* Notification banner */
 .notif-banner{background:linear-gradient(135deg,rgba(26,60,46,.07),rgba(26,60,46,.03));border:1px solid rgba(26,60,46,.15);border-radius:12px;padding:12px 14px;display:flex;align-items:center;gap:11px;}
 .notif-icon{font-size:1.3rem;flex-shrink:0;}
 .notif-btn{flex-shrink:0;background:var(--green);color:white;border:none;border-radius:20px;padding:7px 14px;font-size:.72rem;font-family:'Lora',serif;cursor:pointer;font-weight:600;}
-.notif-btn.enabled{background:var(--green2);}
+.token-box{background:var(--parchment);border:1px solid var(--border);border-radius:8px;padding:10px 12px;margin-top:10px;word-break:break-all;font-size:.62rem;color:var(--sepia);font-family:monospace;line-height:1.5;}
+.copy-btn{background:var(--gold);color:white;border:none;border-radius:8px;padding:6px 12px;font-size:.7rem;cursor:pointer;font-family:'Lora',serif;margin-top:7px;width:100%;}
 </style>
 </head>
 <body>
@@ -100,436 +102,144 @@ select,input[type=text]{width:100%;border:1px solid var(--border);border-radius:
 <script>
 'use strict';
 
-// ══════════════════════════════════════════════════════════
-//  SERVICE WORKER REGISTRATION
-// ══════════════════════════════════════════════════════════
+// ══ FIREBASE CONFIG ══
+const FB_CONFIG = {
+  apiKey: "AIzaSyBTfA-W5bl6Eb2U6IQxyPvGDETx989SDtA",
+  authDomain: "hifdh-tracker-da869.firebaseapp.com",
+  projectId: "hifdh-tracker-da869",
+  storageBucket: "hifdh-tracker-da869.firebasestorage.app",
+  messagingSenderId: "43337176433",
+  appId: "1:43337176433:web:a4527e43250cdb531a92d0"
+};
+const VAPID_KEY = "BGqeXGSnUnzw2y6eoN0_1h-Cjq7Jf3-NcBzcOudRcaOmo45QCHwJcX6H-S9jOAbZJ16Pok6loXW6PYwVHSVNsJU";
+
+// ── Initialise Firebase ──
+const fbApp = firebase.initializeApp(FB_CONFIG);
+const messaging = firebase.messaging(fbApp);
+
+// ── Foreground push (app is open) ──
+messaging.onMessage(payload => {
+  const title = payload.notification?.title || 'مُتابَعَةُ الحِفْظِ';
+  const body  = payload.notification?.body  || 'Time for your Hifdh session';
+  if (Notification.permission === 'granted') {
+    new Notification(title, { body, icon: 'icon-192.png', tag: 'hifdh-reminder' });
+  }
+});
+
+// ══ SERVICE WORKER REGISTRATION ══
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('/hifdh-tracker/service-worker.js')
-      .then(reg => { console.log('SW registered:', reg.scope); })
-      .catch(err => { console.warn('SW registration failed:', err); });
+      .then(reg => console.log('SW registered:', reg.scope))
+      .catch(err => console.warn('SW failed:', err));
   });
 }
 
-// ══════════════════════════════════════════════════════════
-//  NOTIFICATION PERMISSION — Phase 3 Firebase key goes here
-// ══════════════════════════════════════════════════════════
-// PHASE_3_VAPID_KEY = 'REPLACE_WITH_YOUR_FIREBASE_VAPID_KEY';
-
+// ══ NOTIFICATION STATE ══
 let notifEnabled = localStorage.getItem('hifdh_notif') === 'granted';
+let fcmToken     = localStorage.getItem('hifdh_fcm_token') || '';
 
 async function enableNotifications() {
   if (!('Notification' in window)) {
-    alert('Notifications are not supported on this device.');
+    alert('Notifications are not supported on this browser.');
     return;
   }
   const perm = await Notification.requestPermission();
-  if (perm === 'granted') {
-    notifEnabled = true;
-    localStorage.setItem('hifdh_notif', 'granted');
-    // Phase 3: subscribe to Firebase push here
-    render();
-    alert('Notifications enabled! Prayer time reminders will be set up in Phase 3.');
-  } else {
-    alert('Notification permission denied. You can enable it in Android Settings → Apps → Chrome → Notifications.');
+  if (perm !== 'granted') {
+    alert('Permission denied.\n\nGo to: Android Settings → Apps → Chrome → Notifications → Allow');
+    return;
+  }
+  try {
+    // Get the FCM token for this device
+    const sw = await navigator.serviceWorker.ready;
+    const token = await messaging.getToken({ vapidKey: VAPID_KEY, serviceWorkerRegistration: sw });
+    if (token) {
+      fcmToken = token;
+      notifEnabled = true;
+      localStorage.setItem('hifdh_notif', 'granted');
+      localStorage.setItem('hifdh_fcm_token', token);
+      render();
+    }
+  } catch (err) {
+    console.error('FCM token error:', err);
+    alert('Could not get notification token. Make sure the app is open via HTTPS and try again.');
   }
 }
 
-// ══════════════════════════════════════════════════════════
-//  HIJRI DATE
-// ══════════════════════════════════════════════════════════
-function toHijri(d) {
-  let y=d.getFullYear(),m=d.getMonth()+1,day=d.getDate();
-  if(m<3){y--;m+=12;}
-  const A=Math.floor(y/100),B=2-A+Math.floor(A/4);
-  const JD=Math.floor(365.25*(y+4716))+Math.floor(30.6001*(m+1))+day+B-1524.5;
-  const Z=Math.floor(JD+.5);let L=Z-1948440+10632;
-  const N=Math.floor((L-1)/10631);L=L-10631*N+354;
-  const J=Math.floor((10985-L)/5316)*Math.floor(50*L/17719)+Math.floor(L/5670)*Math.floor(43*L/15238);
-  L=L-Math.floor((30-J)/15)*Math.floor(17719*J/50)-Math.floor(J/16)*Math.floor(15238*J/43)+29;
-  return{y:30*N+J-30,m:Math.floor(24*L/709),d:L-Math.floor(709*Math.floor(24*L/709)/24)};
+function copyToken() {
+  navigator.clipboard.writeText(fcmToken).then(() => {
+    alert('Token copied! You will paste this into Cloudflare in Phase 4.');
+  });
 }
+
+// ══ HIJRI DATE ══
+function toHijri(d){let y=d.getFullYear(),m=d.getMonth()+1,day=d.getDate();if(m<3){y--;m+=12;}const A=Math.floor(y/100),B=2-A+Math.floor(A/4),JD=Math.floor(365.25*(y+4716))+Math.floor(30.6001*(m+1))+day+B-1524.5,Z=Math.floor(JD+.5);let L=Z-1948440+10632;const N=Math.floor((L-1)/10631);L=L-10631*N+354;const J=Math.floor((10985-L)/5316)*Math.floor(50*L/17719)+Math.floor(L/5670)*Math.floor(43*L/15238);L=L-Math.floor((30-J)/15)*Math.floor(17719*J/50)-Math.floor(J/16)*Math.floor(15238*J/43)+29;return{y:30*N+J-30,m:Math.floor(24*L/709),d:L-Math.floor(709*Math.floor(24*L/709)/24)};}
 const HM=['مُحَرَّم','صَفَر','رَبِيعُ الأَوَّل','رَبِيعُ الثَّانِي','جُمَادَى الأُولَى','جُمَادَى الثَّانِيَة','رَجَب','شَعْبَان','رَمَضَان','شَوَّال','ذُو القَعْدَة','ذُو الحِجَّة'];
 const AR_DAYS=['الأَحَد','الإِثْنَيْن','الثُّلَاثَاء','الأَرْبِعَاء','الخَمِيس','الجُمُعَة','السَّبْت'];
 
-// ══════════════════════════════════════════════════════════
-//  QURAN DATA
-// ══════════════════════════════════════════════════════════
-const su = ar => `سُورَةُ ${ar}`;
-const ALL_SURAHS = [
-  {n:1,ar:'الفَاتِحَة',en:'Al-Fatiha',s:1,e:1},{n:2,ar:'البَقَرَة',en:'Al-Baqara',s:2,e:49},
-  {n:3,ar:'آلِ عِمْرَان',en:'Ali-Imran',s:50,e:76},{n:4,ar:'النِّسَاء',en:'An-Nisa',s:77,e:106},
-  {n:5,ar:'المَائِدَة',en:'Al-Maeda',s:106,e:127},{n:6,ar:'الأَنْعَام',en:'Al-Anaam',s:128,e:150},
-  {n:7,ar:'الأَعْرَاف',en:'Al-Araf',s:151,e:176},{n:8,ar:'الأَنْفَال',en:'Al-Anfal',s:177,e:186},
-  {n:9,ar:'التَّوْبَة',en:'At-Tawbah',s:187,e:207},{n:10,ar:'يُونُس',en:'Yunus',s:208,e:221},
-  {n:11,ar:'هُود',en:'Hud',s:221,e:235},{n:12,ar:'يُوسُف',en:'Yusuf',s:235,e:248},
-  {n:13,ar:'الرَّعْد',en:'Ar-Raad',s:249,e:255},{n:14,ar:'إِبْرَاهِيم',en:'Ibrahim',s:255,e:261},
-  {n:15,ar:'الحِجْر',en:'Al-Hijr',s:262,e:267},{n:16,ar:'النَّحْل',en:'An-Nahl',s:267,e:281},
-  {n:17,ar:'الإِسْرَاء',en:'Al-Isra',s:282,e:293},{n:18,ar:'الكَهْف',en:'Al-Kahf',s:293,e:304},
-  {n:19,ar:'مَرْيَم',en:'Mariam',s:305,e:311},{n:20,ar:'طٰهٰ',en:'Taha',s:312,e:321},
-  {n:21,ar:'الأَنْبِيَاء',en:'Al-Ambiya',s:322,e:331},{n:22,ar:'الحَجّ',en:'Al-Hajj',s:332,e:341},
-  {n:23,ar:'المُؤْمِنُون',en:'Al-Mumenoon',s:342,e:349},{n:24,ar:'النُّور',en:'An-Noor',s:350,e:359},
-  {n:25,ar:'الفُرْقَان',en:'Al-Furqan',s:359,e:366},{n:26,ar:'الشُّعَرَاء',en:'Ash-Shuara',s:367,e:376},
-  {n:27,ar:'النَّمْل',en:'An-Naml',s:377,e:385},{n:28,ar:'القَصَص',en:'Al-Qasas',s:385,e:396},
-  {n:29,ar:'العَنْكَبُوت',en:'Al-Ankaboot',s:396,e:404},{n:30,ar:'الرُّوم',en:'Ar-Room',s:404,e:410},
-  {n:31,ar:'لُقْمَان',en:'Luqman',s:411,e:414},{n:32,ar:'السَّجْدَة',en:'As-Sajda',s:415,e:417},
-  {n:33,ar:'الأَحْزَاب',en:'Al-Ahzab',s:418,e:427},{n:34,ar:'سَبَأ',en:'Saba',s:428,e:434},
-  {n:35,ar:'فَاطِر',en:'Fatir',s:434,e:440},{n:36,ar:'يٰس',en:'Ya-Sin',s:440,e:445},
-  {n:37,ar:'الصَّافَّات',en:'As-Saffat',s:446,e:452},{n:38,ar:'ص',en:'Sad',s:453,e:458},
-  {n:39,ar:'الزُّمَر',en:'Az-Zumar',s:458,e:467},{n:40,ar:'غَافِر',en:'Al-Ghafir',s:467,e:476},
-  {n:41,ar:'فُصِّلَت',en:'Fussilat',s:477,e:482},{n:42,ar:'الشُّورَىٰ',en:'Ash-Shura',s:483,e:489},
-  {n:43,ar:'الزُّخْرُف',en:'Az-Zukhruf',s:489,e:495},{n:44,ar:'الدُّخَان',en:'Ad-Dukhan',s:496,e:498},
-  {n:45,ar:'الجَاثِيَة',en:'Al-Jathiya',s:499,e:502},{n:46,ar:'الأَحْقَاف',en:'Al-Ahqaf',s:502,e:506},
-  {n:47,ar:'مُحَمَّد',en:'Muhammad',s:507,e:510},{n:48,ar:'الفَتْح',en:'Al-Fath',s:511,e:515},
-  {n:49,ar:'الحُجُرَات',en:'Al-Hujurat',s:515,e:517},{n:50,ar:'ق',en:'Qaf',s:518,e:520},
-  {n:51,ar:'الذَّارِيَات',en:'Adh-Dhariyat',s:520,e:523},{n:52,ar:'الطُّور',en:'At-Tur',s:523,e:525},
-  {n:53,ar:'النَّجْم',en:'An-Najm',s:526,e:528},{n:54,ar:'القَمَر',en:'Al-Qamar',s:528,e:531},
-  {n:55,ar:'الرَّحْمَٰن',en:'Ar-Rahman',s:531,e:533},{n:56,ar:'الوَاقِعَة',en:'Al-Waqia',s:534,e:537},
-  {n:57,ar:'الحَدِيد',en:'Al-Hadid',s:537,e:541},{n:58,ar:'المُجَادِلَة',en:'Al-Mujadila',s:542,e:545},
-  {n:59,ar:'الحَشْر',en:'Al-Hashr',s:545,e:548},{n:60,ar:'المُمْتَحَنَة',en:'Al-Mumtahina',s:549,e:551},
-  {n:61,ar:'الصَّفّ',en:'As-Saf',s:551,e:552},{n:62,ar:'الجُمُعَة',en:'Al-Jumua',s:553,e:554},
-  {n:63,ar:'المُنَافِقُون',en:'Al-Munafiqoon',s:554,e:555},{n:64,ar:'التَّغَابُن',en:'At-Taghabun',s:556,e:557},
-  {n:65,ar:'الطَّلَاق',en:'At-Talaq',s:558,e:559},{n:66,ar:'التَّحْرِيم',en:'At-Tahrim',s:560,e:561},
-  {n:67,ar:'المُلْك',en:'Al-Mulk',s:562,e:564},{n:68,ar:'القَلَم',en:'Al-Qalam',s:564,e:566},
-  {n:69,ar:'الحَاقَّة',en:'Al-Haaqa',s:566,e:568},{n:70,ar:'المَعَارِج',en:'Al-Maarij',s:568,e:570},
-  {n:71,ar:'نُوح',en:'Nooh',s:570,e:571},{n:72,ar:'الجِنّ',en:'Al-Jinn',s:572,e:573},
-  {n:73,ar:'المُزَّمِّل',en:'Al-Muzzammil',s:574,e:575},{n:74,ar:'المُدَّثِّر',en:'Al-Muddathir',s:575,e:577},
-  {n:75,ar:'القِيَامَة',en:'Al-Qiyama',s:577,e:578},{n:76,ar:'الإِنْسَان',en:'Al-Insan',s:578,e:580},
-  {n:77,ar:'المُرْسَلَات',en:'Al-Mursalat',s:580,e:581},{n:78,ar:'النَّبَأ',en:'An-Naba',s:582,e:583},
-  {n:79,ar:'النَّازِعَات',en:'An-Naziaat',s:583,e:584},{n:80,ar:'عَبَسَ',en:'Abasa',s:585,e:586},
-  {n:81,ar:'التَّكْوِير',en:'At-Takwir',s:586,e:586},{n:82,ar:'الإِنْفِطَار',en:'Al-Infitar',s:587,e:587},
-  {n:83,ar:'المُطَفِّفِين',en:'Al-Mutaffifin',s:587,e:589},{n:84,ar:'الإِنْشِقَاق',en:'Al-Inshiqaq',s:589,e:590},
-  {n:85,ar:'البُرُوج',en:'Al-Burooj',s:590,e:590},{n:86,ar:'الطَّارِق',en:'At-Tariq',s:591,e:591},
-  {n:87,ar:'الأَعْلَىٰ',en:'Al-Ala',s:591,e:592},{n:88,ar:'الغَاشِيَة',en:'Al-Ghashiya',s:592,e:593},
-  {n:89,ar:'الفَجْر',en:'Al-Fajr',s:593,e:594},{n:90,ar:'البَلَد',en:'Al-Balad',s:594,e:595},
-  {n:91,ar:'الشَّمْس',en:'Ash-Shams',s:595,e:595},{n:92,ar:'اللَّيْل',en:'Al-Lail',s:595,e:596},
-  {n:93,ar:'الضُّحَىٰ',en:'Ad-Dhuha',s:596,e:596},{n:94,ar:'الشَّرْح',en:'Al-Inshirah',s:596,e:597},
-  {n:95,ar:'التِّين',en:'At-Tin',s:597,e:597},{n:96,ar:'العَلَق',en:'Al-Alaq',s:597,e:598},
-  {n:97,ar:'القَدْر',en:'Al-Qadr',s:598,e:598},{n:98,ar:'البَيِّنَة',en:'Al-Bayyina',s:598,e:599},
-  {n:99,ar:'الزَّلْزَلَة',en:'Al-Zalzala',s:599,e:599},{n:100,ar:'العَادِيَات',en:'Al-Adiyat',s:599,e:600},
-  {n:101,ar:'القَارِعَة',en:'Al-Qaria',s:600,e:600},{n:102,ar:'التَّكَاثُر',en:'At-Takathur',s:600,e:600},
-  {n:103,ar:'العَصْر',en:'Al-Asr',s:601,e:601},{n:104,ar:'الهُمَزَة',en:'Al-Humaza',s:601,e:601},
-  {n:105,ar:'الفِيل',en:'Al-Fil',s:601,e:601},{n:106,ar:'قُرَيْش',en:'Quraish',s:602,e:602},
-  {n:107,ar:'المَاعُون',en:'Al-Maun',s:602,e:602},{n:108,ar:'الكَوْثَر',en:'Al-Kawthar',s:602,e:602},
-  {n:109,ar:'الكَافِرُون',en:'Al-Kafiroon',s:603,e:603},{n:110,ar:'النَّصْر',en:'An-Nasr',s:603,e:603},
-  {n:111,ar:'المَسَد',en:'Al-Masad',s:603,e:603},{n:112,ar:'الإِخْلَاص',en:'Al-Ikhlas',s:604,e:604},
-  {n:113,ar:'الفَلَق',en:'Al-Falaq',s:604,e:604},{n:114,ar:'النَّاس',en:'An-Nas',s:604,e:604}
-];
-
+// ══ QURAN DATA ══
+const su=ar=>`سُورَةُ ${ar}`;
+const ALL_SURAHS=[{n:1,ar:'الفَاتِحَة',en:'Al-Fatiha',s:1,e:1},{n:2,ar:'البَقَرَة',en:'Al-Baqara',s:2,e:49},{n:3,ar:'آلِ عِمْرَان',en:'Ali-Imran',s:50,e:76},{n:4,ar:'النِّسَاء',en:'An-Nisa',s:77,e:106},{n:5,ar:'المَائِدَة',en:'Al-Maeda',s:106,e:127},{n:6,ar:'الأَنْعَام',en:'Al-Anaam',s:128,e:150},{n:7,ar:'الأَعْرَاف',en:'Al-Araf',s:151,e:176},{n:8,ar:'الأَنْفَال',en:'Al-Anfal',s:177,e:186},{n:9,ar:'التَّوْبَة',en:'At-Tawbah',s:187,e:207},{n:10,ar:'يُونُس',en:'Yunus',s:208,e:221},{n:11,ar:'هُود',en:'Hud',s:221,e:235},{n:12,ar:'يُوسُف',en:'Yusuf',s:235,e:248},{n:13,ar:'الرَّعْد',en:'Ar-Raad',s:249,e:255},{n:14,ar:'إِبْرَاهِيم',en:'Ibrahim',s:255,e:261},{n:15,ar:'الحِجْر',en:'Al-Hijr',s:262,e:267},{n:16,ar:'النَّحْل',en:'An-Nahl',s:267,e:281},{n:17,ar:'الإِسْرَاء',en:'Al-Isra',s:282,e:293},{n:18,ar:'الكَهْف',en:'Al-Kahf',s:293,e:304},{n:19,ar:'مَرْيَم',en:'Mariam',s:305,e:311},{n:20,ar:'طٰهٰ',en:'Taha',s:312,e:321},{n:21,ar:'الأَنْبِيَاء',en:'Al-Ambiya',s:322,e:331},{n:22,ar:'الحَجّ',en:'Al-Hajj',s:332,e:341},{n:23,ar:'المُؤْمِنُون',en:'Al-Mumenoon',s:342,e:349},{n:24,ar:'النُّور',en:'An-Noor',s:350,e:359},{n:25,ar:'الفُرْقَان',en:'Al-Furqan',s:359,e:366},{n:26,ar:'الشُّعَرَاء',en:'Ash-Shuara',s:367,e:376},{n:27,ar:'النَّمْل',en:'An-Naml',s:377,e:385},{n:28,ar:'القَصَص',en:'Al-Qasas',s:385,e:396},{n:29,ar:'العَنْكَبُوت',en:'Al-Ankaboot',s:396,e:404},{n:30,ar:'الرُّوم',en:'Ar-Room',s:404,e:410},{n:31,ar:'لُقْمَان',en:'Luqman',s:411,e:414},{n:32,ar:'السَّجْدَة',en:'As-Sajda',s:415,e:417},{n:33,ar:'الأَحْزَاب',en:'Al-Ahzab',s:418,e:427},{n:34,ar:'سَبَأ',en:'Saba',s:428,e:434},{n:35,ar:'فَاطِر',en:'Fatir',s:434,e:440},{n:36,ar:'يٰس',en:'Ya-Sin',s:440,e:445},{n:37,ar:'الصَّافَّات',en:'As-Saffat',s:446,e:452},{n:38,ar:'ص',en:'Sad',s:453,e:458},{n:39,ar:'الزُّمَر',en:'Az-Zumar',s:458,e:467},{n:40,ar:'غَافِر',en:'Al-Ghafir',s:467,e:476},{n:41,ar:'فُصِّلَت',en:'Fussilat',s:477,e:482},{n:42,ar:'الشُّورَىٰ',en:'Ash-Shura',s:483,e:489},{n:43,ar:'الزُّخْرُف',en:'Az-Zukhruf',s:489,e:495},{n:44,ar:'الدُّخَان',en:'Ad-Dukhan',s:496,e:498},{n:45,ar:'الجَاثِيَة',en:'Al-Jathiya',s:499,e:502},{n:46,ar:'الأَحْقَاف',en:'Al-Ahqaf',s:502,e:506},{n:47,ar:'مُحَمَّد',en:'Muhammad',s:507,e:510},{n:48,ar:'الفَتْح',en:'Al-Fath',s:511,e:515},{n:49,ar:'الحُجُرَات',en:'Al-Hujurat',s:515,e:517},{n:50,ar:'ق',en:'Qaf',s:518,e:520},{n:51,ar:'الذَّارِيَات',en:'Adh-Dhariyat',s:520,e:523},{n:52,ar:'الطُّور',en:'At-Tur',s:523,e:525},{n:53,ar:'النَّجْم',en:'An-Najm',s:526,e:528},{n:54,ar:'القَمَر',en:'Al-Qamar',s:528,e:531},{n:55,ar:'الرَّحْمَٰن',en:'Ar-Rahman',s:531,e:533},{n:56,ar:'الوَاقِعَة',en:'Al-Waqia',s:534,e:537},{n:57,ar:'الحَدِيد',en:'Al-Hadid',s:537,e:541},{n:58,ar:'المُجَادِلَة',en:'Al-Mujadila',s:542,e:545},{n:59,ar:'الحَشْر',en:'Al-Hashr',s:545,e:548},{n:60,ar:'المُمْتَحَنَة',en:'Al-Mumtahina',s:549,e:551},{n:61,ar:'الصَّفّ',en:'As-Saf',s:551,e:552},{n:62,ar:'الجُمُعَة',en:'Al-Jumua',s:553,e:554},{n:63,ar:'المُنَافِقُون',en:'Al-Munafiqoon',s:554,e:555},{n:64,ar:'التَّغَابُن',en:'At-Taghabun',s:556,e:557},{n:65,ar:'الطَّلَاق',en:'At-Talaq',s:558,e:559},{n:66,ar:'التَّحْرِيم',en:'At-Tahrim',s:560,e:561},{n:67,ar:'المُلْك',en:'Al-Mulk',s:562,e:564},{n:68,ar:'القَلَم',en:'Al-Qalam',s:564,e:566},{n:69,ar:'الحَاقَّة',en:'Al-Haaqa',s:566,e:568},{n:70,ar:'المَعَارِج',en:'Al-Maarij',s:568,e:570},{n:71,ar:'نُوح',en:'Nooh',s:570,e:571},{n:72,ar:'الجِنّ',en:'Al-Jinn',s:572,e:573},{n:73,ar:'المُزَّمِّل',en:'Al-Muzzammil',s:574,e:575},{n:74,ar:'المُدَّثِّر',en:'Al-Muddathir',s:575,e:577},{n:75,ar:'القِيَامَة',en:'Al-Qiyama',s:577,e:578},{n:76,ar:'الإِنْسَان',en:'Al-Insan',s:578,e:580},{n:77,ar:'المُرْسَلَات',en:'Al-Mursalat',s:580,e:581},{n:78,ar:'النَّبَأ',en:'An-Naba',s:582,e:583},{n:79,ar:'النَّازِعَات',en:'An-Naziaat',s:583,e:584},{n:80,ar:'عَبَسَ',en:'Abasa',s:585,e:586},{n:81,ar:'التَّكْوِير',en:'At-Takwir',s:586,e:586},{n:82,ar:'الإِنْفِطَار',en:'Al-Infitar',s:587,e:587},{n:83,ar:'المُطَفِّفِين',en:'Al-Mutaffifin',s:587,e:589},{n:84,ar:'الإِنْشِقَاق',en:'Al-Inshiqaq',s:589,e:590},{n:85,ar:'البُرُوج',en:'Al-Burooj',s:590,e:590},{n:86,ar:'الطَّارِق',en:'At-Tariq',s:591,e:591},{n:87,ar:'الأَعْلَىٰ',en:'Al-Ala',s:591,e:592},{n:88,ar:'الغَاشِيَة',en:'Al-Ghashiya',s:592,e:593},{n:89,ar:'الفَجْر',en:'Al-Fajr',s:593,e:594},{n:90,ar:'البَلَد',en:'Al-Balad',s:594,e:595},{n:91,ar:'الشَّمْس',en:'Ash-Shams',s:595,e:595},{n:92,ar:'اللَّيْل',en:'Al-Lail',s:595,e:596},{n:93,ar:'الضُّحَىٰ',en:'Ad-Dhuha',s:596,e:596},{n:94,ar:'الشَّرْح',en:'Al-Inshirah',s:596,e:597},{n:95,ar:'التِّين',en:'At-Tin',s:597,e:597},{n:96,ar:'العَلَق',en:'Al-Alaq',s:597,e:598},{n:97,ar:'القَدْر',en:'Al-Qadr',s:598,e:598},{n:98,ar:'البَيِّنَة',en:'Al-Bayyina',s:598,e:599},{n:99,ar:'الزَّلْزَلَة',en:'Al-Zalzala',s:599,e:599},{n:100,ar:'العَادِيَات',en:'Al-Adiyat',s:599,e:600},{n:101,ar:'القَارِعَة',en:'Al-Qaria',s:600,e:600},{n:102,ar:'التَّكَاثُر',en:'At-Takathur',s:600,e:600},{n:103,ar:'العَصْر',en:'Al-Asr',s:601,e:601},{n:104,ar:'الهُمَزَة',en:'Al-Humaza',s:601,e:601},{n:105,ar:'الفِيل',en:'Al-Fil',s:601,e:601},{n:106,ar:'قُرَيْش',en:'Quraish',s:602,e:602},{n:107,ar:'المَاعُون',en:'Al-Maun',s:602,e:602},{n:108,ar:'الكَوْثَر',en:'Al-Kawthar',s:602,e:602},{n:109,ar:'الكَافِرُون',en:'Al-Kafiroon',s:603,e:603},{n:110,ar:'النَّصْر',en:'An-Nasr',s:603,e:603},{n:111,ar:'المَسَد',en:'Al-Masad',s:603,e:603},{n:112,ar:'الإِخْلَاص',en:'Al-Ikhlas',s:604,e:604},{n:113,ar:'الفَلَق',en:'Al-Falaq',s:604,e:604},{n:114,ar:'النَّاس',en:'An-Nas',s:604,e:604}];
 const JUZ=[1,22,42,62,82,102,122,142,162,182,202,222,242,262,282,302,322,342,362,382,402,422,442,462,482,502,522,542,562,582];
-const gJ = p => { for(let i=JUZ.length-1;i>=0;i--) if(p>=JUZ[i]) return i+1; return 1; };
-const gH = p => { const j=gJ(p); return (j-1)*2+1+(p-JUZ[j-1]>=10?1:0); };
-const gS = p => [...new Map(ALL_SURAHS.filter(s=>p>=s.s&&p<=s.e).map(s=>[s.n,s])).values()];
-const bQ = () => { const q=[]; for(let p=483;p<=604;p++) q.push(p); for(let p=293;p<=304;p++) q.push(p); return q; };
-const mkS = q => { const o=[]; for(let i=0;i<q.length;i+=10) o.push(q.slice(i,Math.min(i+10,q.length))); return o; };
+const gJ=p=>{for(let i=JUZ.length-1;i>=0;i--)if(p>=JUZ[i])return i+1;return 1;};
+const gH=p=>{const j=gJ(p);return(j-1)*2+1+(p-JUZ[j-1]>=10?1:0);};
+const gS=p=>[...new Map(ALL_SURAHS.filter(s=>p>=s.s&&p<=s.e).map(s=>[s.n,s])).values()];
+const bQ=()=>{const q=[];for(let p=483;p<=604;p++)q.push(p);for(let p=293;p<=304;p++)q.push(p);return q;};
+const mkS=q=>{const o=[];for(let i=0;i<q.length;i+=10)o.push(q.slice(i,Math.min(i+10,q.length)));return o;};
+const SL=[{id:'sobh',ar:'الصُّبْح',en:'Sobh',sl:[0,2]},{id:'pre_dhuhr',ar:'قَبْلَ الظُّهْرِ',en:'Before Dhuhr',sl:[2,4]},{id:'post_dhuhr',ar:'بَعْدَ الظُّهْرِ',en:'After Dhuhr',sl:[4,6]},{id:'post_maghrib',ar:'بَعْدَ المَغْرِبِ',en:'After Maghrib',sl:[6,8]},{id:'post_isha',ar:'بَعْدَ العِشَاءِ',en:'After Isha',sl:[8,10]},{id:'tahajjud',ar:'قِيَامُ اللَّيْلِ',en:'Tahajjud',sl:null}];
 
-const SL = [
-  {id:'sobh',ar:'الصُّبْح',en:'Sobh',sl:[0,2]},
-  {id:'pre_dhuhr',ar:'قَبْلَ الظُّهْرِ',en:'Before Dhuhr',sl:[2,4]},
-  {id:'post_dhuhr',ar:'بَعْدَ الظُّهْرِ',en:'After Dhuhr',sl:[4,6]},
-  {id:'post_maghrib',ar:'بَعْدَ المَغْرِبِ',en:'After Maghrib',sl:[6,8]},
-  {id:'post_isha',ar:'بَعْدَ العِشَاءِ',en:'After Isha',sl:[8,10]},
-  {id:'tahajjud',ar:'قِيَامُ اللَّيْلِ',en:'Tahajjud',sl:null}
-];
+// ══ STATE ══
+let ST=null;
+const SK='hifdh_v2';
+const TODAY=new Date().toISOString().split('T')[0];
+function mI(){return{queue:bQ(),sessionIdx:0,cycle:1,sData:{},hifdh:[{id:'ghafir-1',surahAr:'غَافِر',surahEn:'Al-Ghafir',surahN:40,pages:[467,468,469,470,471],weekNum:1,category:'recent',startDate:TODAY,endDate:new Date(Date.now()+6*864e5).toISOString().split('T')[0],memorized:true,memorizedAt:new Date().toISOString(),reviews:{},graduated:false,graduatedAt:null}]};}
+function loadSt(){try{const r=localStorage.getItem(SK);return r?JSON.parse(r):null;}catch{return null;}}
+function saveSt(){try{localStorage.setItem(SK,JSON.stringify(ST));}catch{}}
+function setState(fn){ST=fn(ST);saveSt();render();}
 
-// ══════════════════════════════════════════════════════════
-//  STATE — localStorage (survives restarts, stays on device)
-// ══════════════════════════════════════════════════════════
-let ST = null;
-const SK = 'hifdh_v2';
-const TODAY = new Date().toISOString().split('T')[0];
+// ══ RING ══
+function ring(done,total,sz,lbl,col='#C8921A'){const r=(sz-9)/2,c=2*Math.PI*r,fill=total>0?Math.min(done/total,1)*c:0,fs=sz>80?'1.2rem':'0.85rem';return`<div class="ring-wrap" style="width:${sz}px;height:${sz}px;"><svg width="${sz}" height="${sz}"><circle cx="${sz/2}" cy="${sz/2}" r="${r}" fill="none" stroke="#DDD3A8" stroke-width="7"/><circle cx="${sz/2}" cy="${sz/2}" r="${r}" fill="none" stroke="${col}" stroke-width="7" stroke-dasharray="${fill} ${c}" stroke-linecap="round" style="transform-origin:${sz/2}px ${sz/2}px;transform:rotate(-90deg)"/></svg><div class="ring-inner"><span class="ring-num" style="font-size:${fs}">${done}<span style="font-size:.62em;color:var(--brown);font-weight:400">/${total}</span></span>${lbl?`<span class="ring-lbl">${lbl}</span>`:''}</div></div>`;}
 
-function mI() {
-  return {
-    queue: bQ(), sessionIdx: 0, cycle: 1, sData: {},
-    hifdh: [{
-      id:'ghafir-1', surahAr:'غَافِر', surahEn:'Al-Ghafir', surahN:40,
-      pages:[467,468,469,470,471], weekNum:1, category:'recent',
-      startDate:TODAY, endDate:new Date(Date.now()+6*864e5).toISOString().split('T')[0],
-      memorized:true, memorizedAt:new Date().toISOString(),
-      reviews:{}, graduated:false, graduatedAt:null
-    }]
-  };
-}
+// ══ TABS ══
+let activeTab='dashboard';
+const TABS=[{id:'dashboard',icon:'◎',label:'Board'},{id:'today',icon:'☾',label:'Today'},{id:'hifdh',icon:'✦',label:'Hifdh'},{id:'notes',icon:'✎',label:'Notes'}];
+let expandedSlot=null,showAddModal=false,modalCat='new';
+function setTab(t){activeTab=t;expandedSlot=null;render();}
 
-function loadSt() {
-  try { const r=localStorage.getItem(SK); return r?JSON.parse(r):null; } catch { return null; }
-}
-function saveSt() {
-  try { localStorage.setItem(SK, JSON.stringify(ST)); } catch {}
-}
-function setState(fn) { ST=fn(ST); saveSt(); render(); }
-
-// ══════════════════════════════════════════════════════════
-//  RING SVG
-// ══════════════════════════════════════════════════════════
-function ring(done,total,sz,lbl,col='#C8921A') {
-  const r=(sz-9)/2, c=2*Math.PI*r, fill=total>0?Math.min(done/total,1)*c:0, fs=sz>80?'1.2rem':'0.85rem';
-  return `<div class="ring-wrap" style="width:${sz}px;height:${sz}px;">
-    <svg width="${sz}" height="${sz}">
-      <circle cx="${sz/2}" cy="${sz/2}" r="${r}" fill="none" stroke="#DDD3A8" stroke-width="7"/>
-      <circle cx="${sz/2}" cy="${sz/2}" r="${r}" fill="none" stroke="${col}" stroke-width="7"
-        stroke-dasharray="${fill} ${c}" stroke-linecap="round"
-        style="transform-origin:${sz/2}px ${sz/2}px;transform:rotate(-90deg)"/>
-    </svg>
-    <div class="ring-inner">
-      <span class="ring-num" style="font-size:${fs}">${done}<span style="font-size:.62em;color:var(--brown);font-weight:400">/${total}</span></span>
-      ${lbl?`<span class="ring-lbl">${lbl}</span>`:''}
-    </div>
-  </div>`;
-}
-
-// ══════════════════════════════════════════════════════════
-//  TABS
-// ══════════════════════════════════════════════════════════
-let activeTab = 'dashboard';
-const TABS = [
-  {id:'dashboard',icon:'◎',label:'Board'},
-  {id:'today',icon:'☾',label:'Today'},
-  {id:'hifdh',icon:'✦',label:'Hifdh'},
-  {id:'notes',icon:'✎',label:'Notes'}
-];
-let expandedSlot = null, showAddModal = false, modalCat = 'new';
-function setTab(t) { activeTab=t; expandedSlot=null; render(); }
-
-// ══════════════════════════════════════════════════════════
-//  NOTIFICATION BANNER
-// ══════════════════════════════════════════════════════════
-function notifBanner() {
-  if (notifEnabled) return `<div class="notif-banner">
-    <span class="notif-icon">🔔</span>
-    <div style="flex:1"><div style="font-size:.78rem;font-weight:600;color:var(--green)">Notifications enabled</div>
-    <div style="font-size:.65rem;color:var(--brown);margin-top:2px">Prayer time reminders active · Phase 3 complete</div></div>
-    <button class="notif-btn enabled" style="cursor:default">✓ Active</button>
-  </div>`;
-
-  if (!('Notification' in window)) return '';
-
-  return `<div class="notif-banner">
-    <span class="notif-icon">🔔</span>
-    <div style="flex:1"><div style="font-size:.78rem;font-weight:600;color:var(--green)">Enable reminders</div>
-    <div style="font-size:.65rem;color:var(--brown);margin-top:2px">Get notified at each prayer slot time</div></div>
-    <button class="notif-btn" onclick="enableNotifications()">Enable</button>
-  </div>`;
-}
-
-// ══════════════════════════════════════════════════════════
-//  DASHBOARD
-// ══════════════════════════════════════════════════════════
-function rD() {
-  const sess=mkS(ST.queue), cur=sess[ST.sessionIdx%sess.length]||[];
-  const ck=`${ST.sessionIdx}_${ST.cycle}`, csd=ST.sData[ck]||{slots:{}};
-  const done=Object.keys(ST.sData).filter(k=>k.endsWith(`_${ST.cycle}`)&&ST.sData[k].status==='completed').length;
-  const tot=sess.length, fp=cur[0], lp=cur[cur.length-1];
-  const sS=gS(fp)[0], eS=gS(lp).slice(-1)[0];
-  const prS=SL.filter(s=>s.id!=='tahajjud');
-  const prD=prS.filter(s=>csd.slots?.[s.id]?.done).length;
-  const tD=csd.slots?.tahajjud?.done;
-  const nH=ST.hifdh.filter(h=>!h.graduated&&h.category==='new');
-  const rH=ST.hifdh.filter(h=>!h.graduated&&h.category==='recent');
-  const bars=prS.map(s=>`<div class="${csd.slots?.[s.id]?.done?'prep-bar-done':'prep-bar-empty'}"></div>`).join('');
-  let hs='';
-  if(rH.length>0){const h=rH[0];const dd=Object.values(h.reviews).filter(r=>r.done).length;hs+=`<div class="card green-border"><div style="display:flex;gap:12px;align-items:center;">${ring(dd,7,68,'Days','#2D6A4F')}<div style="flex:1"><div style="font-family:'Amiri',serif;font-size:1rem;color:var(--green2);margin-bottom:3px">الحِفْظُ القَرِيبُ · Week ${h.weekNum}</div><div style="font-family:'Amiri',serif;font-size:1.2rem;color:var(--green);direction:rtl;text-align:right">${su(h.surahAr)}</div><div style="font-size:.7rem;color:var(--brown);margin-top:3px">pp. ${h.pages[0]}–${h.pages[h.pages.length-1]} · ${7-dd>0?`${7-dd} days left`:'✓ Ready!'}</div></div></div><button class="btn-secondary" onclick="setTab('hifdh')" style="margin-top:9px;font-size:.75rem">View Hifdh Tracker →</button></div>`;}
-  if(nH.length>0){const h=nH[0];hs+=`<div class="card" style="border-color:var(--gold2)"><div style="font-family:'Amiri',serif;font-size:1rem;color:var(--gold);margin-bottom:4px">الحِفْظُ الجَدِيدُ · In Progress</div><div style="font-family:'Amiri',serif;font-size:1.2rem;color:var(--green);direction:rtl;text-align:right">${su(h.surahAr)}</div><div style="font-size:.7rem;color:var(--brown);margin-top:3px">pp. ${h.pages[0]}–${h.pages[h.pages.length-1]}</div><button class="btn-secondary" onclick="setTab('hifdh')" style="margin-top:9px;font-size:.75rem">View Hifdh Tracker →</button></div>`;}
-  return `<div class="view">
-    ${notifBanner()}
-    <div class="card" style="background:linear-gradient(160deg,#0F2A1E 0%,#1A3C2E 60%,#2D6A4F 100%);border:none;padding:18px 18px 16px;">
-      <div style="display:flex;align-items:center;gap:16px;">${ring(done,tot,92,'Sessions','#C8921A')}<div style="color:white;flex:1;"><div style="font-family:'Amiri',serif;font-size:1rem;color:var(--gold);margin-bottom:4px">الدَّوْرَة ${ST.cycle}</div><div style="font-size:1.05rem;font-weight:600">Cycle ${ST.cycle}</div><div style="font-size:.7rem;color:rgba(255,255,255,.55);margin-top:5px">${done} completed · ${tot-done} remaining</div></div></div>
-      <div style="height:1px;background:linear-gradient(90deg,transparent,rgba(200,146,26,.4),transparent);margin:13px 0 11px;"></div>
-      <div style="font-size:.58rem;text-transform:uppercase;letter-spacing:.12em;color:var(--gold);margin-bottom:7px">Today · Session ${ST.sessionIdx+1} of ${tot}</div>
-      <div style="font-family:'Amiri',serif;font-size:1.35rem;color:white;direction:rtl;text-align:right;line-height:1.5">${su(sS?.ar||'')}${sS?.n!==eS?.n?`<span style="color:rgba(255,255,255,.4)"> ← ${su(eS?.ar||'')}</span>`:''}</div>
-      <div style="display:flex;gap:6px;margin-top:7px;flex-wrap:wrap">
-        <span style="font-size:.62rem;padding:3px 9px;border-radius:20px;background:rgba(200,146,26,.2);color:var(--gold);border:1px solid rgba(200,146,26,.3)">الجُزْء ${gJ(fp)}</span>
-        <span style="font-size:.62rem;padding:3px 9px;border-radius:20px;background:rgba(255,255,255,.07);color:rgba(255,255,255,.6)">الحِزْب ${gH(fp)}</span>
-        <span style="font-size:.62rem;padding:3px 9px;border-radius:20px;background:rgba(255,255,255,.07);color:rgba(255,255,255,.6)">pp. ${fp}–${lp}</span>
-      </div>
-      <div style="margin-top:12px;display:flex;gap:5px;align-items:center">${bars}<div class="${tD?'tahajjud-bar-done':'tahajjud-bar-empty'}"></div></div>
-      <div style="font-size:.62rem;color:rgba(255,255,255,.4);margin-top:5px">${prD}/5 prep · ${tD?'★ Tahajjud done':'☆ Tahajjud pending'}</div>
-      <button class="btn-primary" onclick="setTab('today')">Open Today's Session →</button>
-    </div>
-    ${hs}
-  </div>`;
-}
-
-// ══════════════════════════════════════════════════════════
-//  TODAY
-// ══════════════════════════════════════════════════════════
-function rT() {
-  const sess=mkS(ST.queue), cur=sess[ST.sessionIdx%sess.length]||[];
-  const ck=`${ST.sessionIdx}_${ST.cycle}`, csd=ST.sData[ck]||{slots:{}};
-  const fp=cur[0], lp=cur[cur.length-1], sS=gS(fp)[0], eS=gS(lp).slice(-1)[0];
-  const cc=SL.filter(s=>csd.slots?.[s.id]?.done).length, pct=Math.round((cc/SL.length)*100);
-  const sh=SL.map(slot=>{
-    const pages=slot.sl?cur.slice(...slot.sl):cur; if(!pages.length) return '';
-    const sd=csd.slots?.[slot.id]||{done:false,note:''};
-    const iT=slot.id==='tahajjud', isE=expandedSlot===slot.id;
-    const ss=[...new Set(pages.flatMap(p=>gS(p).map(s=>su(s.ar))))].join(' · ');
-    const pi=iT?`Full Hizb · pp. ${fp}–${lp}`:`pp. ${pages[0]}–${pages[pages.length-1]}`;
-    return `<div class="slot-card ${iT?'tahajjud':''} ${sd.done?'done-bg':''}">
-      <div style="display:flex;align-items:center;gap:11px;">
-        <button class="check-btn ${sd.done?'checked':''}" onclick="tSlot('${slot.id}')">${sd.done?'✓':''}</button>
-        <div style="flex:1;min-width:0;">
-          <div style="display:flex;align-items:baseline;gap:7px;flex-wrap:wrap">
-            <span style="font-family:'Amiri',serif;font-size:1.05rem;color:var(--green)">${slot.ar}</span>
-            <span style="font-size:.65rem;color:var(--brown)">${slot.en}</span>
-            ${iT?`<span style="font-size:.6rem;color:var(--gold);background:rgba(200,146,26,.1);padding:2px 7px;border-radius:10px;border:1px solid rgba(200,146,26,.3)">نِهَايَة الحِزْب</span>`:''}
-          </div>
-          <div style="font-size:.67rem;color:var(--brown);margin-top:2px">${pi} · <span style="font-family:'Amiri',serif;font-size:.75rem">${ss}</span></div>
-          ${sd.note&&!isE?`<div style="font-size:.63rem;color:var(--gold);margin-top:3px">📝 ${sd.note.substring(0,55)}${sd.note.length>55?'…':''}</div>`:''}
-        </div>
-        <button class="note-btn ${sd.note?'has-note':''}" onclick="tExp('${slot.id}')">✎</button>
-      </div>
-      ${isE?`<div style="margin-top:8px;padding-top:8px;border-top:1px solid #EDE8D8">
-        <textarea class="note-area" id="note-${slot.id}" placeholder="Weak spots, mutashabihat, areas needing focus...">${sd.note||''}</textarea>
-        <div style="display:flex;gap:7px;margin-top:6px">
-          <button onclick="sNote('${slot.id}')" style="background:var(--green);color:white;border:none;border-radius:7px;padding:6px 14px;font-size:.72rem;cursor:pointer;font-family:'Lora',serif">Save</button>
-          ${sd.doneAt?`<span style="font-size:.6rem;color:var(--brown);align-self:center">✓ ${new Date(sd.doneAt).toLocaleString()}</span>`:''}
-        </div>
-      </div>`:''}
-    </div>`;
-  }).join('');
-  return `<div class="view">
-    <div class="card" style="background:linear-gradient(160deg,#0F2A1E,#1A3C2E,#2D6A4F);border:none;">
-      <button class="back-btn" onclick="setTab('dashboard')">← Board</button>
-      <div style="font-size:.58rem;text-transform:uppercase;letter-spacing:.12em;color:var(--gold);margin-bottom:5px">Session ${ST.sessionIdx+1} · Cycle ${ST.cycle}</div>
-      <div style="font-family:'Amiri',serif;font-size:1.4rem;color:white;direction:rtl;text-align:right;line-height:1.5">${su(sS?.ar||'')}${sS?.n!==eS?.n?`<span style="color:rgba(255,255,255,.45)"> ← ${su(eS?.ar||'')}</span>`:''}</div>
-      <div style="display:flex;gap:7px;margin-top:7px;flex-wrap:wrap">
-        <span style="font-size:.63rem;padding:3px 9px;border-radius:20px;background:rgba(200,146,26,.2);color:var(--gold);border:1px solid rgba(200,146,26,.3)">الجُزْء ${gJ(fp)}</span>
-        <span style="font-size:.63rem;padding:3px 9px;border-radius:20px;background:rgba(255,255,255,.07);color:rgba(255,255,255,.6)">الحِزْب ${gH(fp)}</span>
-        <span style="font-size:.63rem;padding:3px 9px;border-radius:20px;background:rgba(255,255,255,.07);color:rgba(255,255,255,.6)">pp. ${fp}–${lp}</span>
-      </div>
-      <div style="margin-top:11px">
-        <div style="display:flex;justify-content:space-between;margin-bottom:5px">
-          <span style="font-size:.6rem;color:rgba(255,255,255,.4)">${cc}/${SL.length} completed</span>
-          <span style="font-size:.6rem;color:var(--gold)">${pct}%</span>
-        </div>
-        <div class="progress-bar-bg"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
-      </div>
-    </div>
-    ${sh}
-    <button class="btn-primary" onclick="adv('completed')">Mark Complete & Next Session →</button>
-    <button class="btn-secondary" onclick="adv('partial')">⚠ Life Happened — Mark Partial & Move On</button>
-    ${ST.sessionIdx>0?`<button onclick="goBack()" style="background:none;border:none;color:var(--brown);font-size:.72rem;cursor:pointer;text-decoration:underline;display:block;margin:4px auto 14px;padding:4px;font-family:'Lora',serif">← Previous session</button>`:'<div style="height:14px"></div>'}
-  </div>`;
-}
-
-// ══════════════════════════════════════════════════════════
-//  HIFDH
-// ══════════════════════════════════════════════════════════
-function rH() {
-  const nH=ST.hifdh.filter(h=>!h.graduated&&h.category==='new');
-  const rH2=ST.hifdh.filter(h=>!h.graduated&&h.category==='recent');
-  const gH=ST.hifdh.filter(h=>h.graduated);
-  function hC(h,isR){
-    const dd=Object.values(h.reviews).filter(r=>r.done).length,rdy=isR&&dd>=7;
-    const db=isR?[1,2,3,4,5,6,7].map(d=>`<button class="day-btn ${h.reviews[d]?.done?'done':''}" onclick="tRev('${h.id}',${d})">${h.reviews[d]?.done?'✓':d}</button>`).join(''):'';
-    return `<div class="card ${rdy?'green-border':''}">
-      <div style="display:flex;gap:12px;align-items:flex-start">
-        ${isR?ring(dd,7,68,'Days','#2D6A4F'):''}
-        <div style="flex:1">
-          <div style="font-family:'Amiri',serif;font-size:1.2rem;color:var(--green);direction:rtl;text-align:right">${su(h.surahAr)}</div>
-          <div style="font-size:.7rem;color:var(--brown);margin-top:2px">${h.surahEn} · Week ${h.weekNum}</div>
-          <div style="font-size:.67rem;color:var(--brown)">Pages: ${h.pages.join(', ')}</div>
-          <div style="font-size:.65rem;color:var(--brown);margin-top:2px">${h.startDate} → ${h.endDate}</div>
-        </div>
-      </div>
-      ${!isR?`<div style="margin-top:10px">${!h.memorized?`<button class="btn-gold" onclick="mMem('${h.id}')">Mark as Memorized ✓ → Begins 7-Day Review</button>`:`<div style="display:inline-flex;align-items:center;gap:6px;background:#D4EDDA;color:#1B5E35;font-size:.68rem;padding:3px 10px;border-radius:20px;margin-top:6px">✓ Memorized</div>`}</div>`:''}
-      ${isR?`<div style="margin-top:12px"><div class="sect-label">Daily Review — tick each day you review</div><div style="display:flex;gap:5px;flex-wrap:wrap">${db}</div>${rdy?`<button class="btn-gold" onclick="grad('${h.id}')" style="margin-top:12px">★ Graduate to Main Queue</button>`:''}</div>`:''}
-    </div>`;
+// ══ NOTIFICATION BANNER ══
+function notifBanner(){
+  if(notifEnabled&&fcmToken){
+    return`<div class="notif-banner"><span class="notif-icon">🔔</span><div style="flex:1"><div style="font-size:.78rem;font-weight:600;color:var(--green)">Notifications enabled</div><div style="font-size:.65rem;color:var(--brown);margin-top:2px">Your device token is saved. Copy it below for Phase 4.</div></div></div>
+    <div class="token-box">${fcmToken}</div>
+    <button class="copy-btn" onclick="copyToken()">📋 Copy Device Token for Phase 4</button>`;
   }
-  const eN=`<div class="card" style="text-align:center;padding:22px;color:var(--brown)"><div style="font-size:1.4rem;margin-bottom:7px;color:var(--gold)">✦</div><div style="font-size:.85rem">No active new memorization</div></div>`;
-  const eR=`<div class="card" style="text-align:center;padding:22px;color:var(--brown)"><div style="font-size:.85rem">No recent hifdh in review</div></div>`;
-  return `<div class="view">
-    <div class="section-header"><div style="flex:1"><div style="font-family:'Amiri',serif;font-size:1.1rem;color:var(--green)">الحِفْظُ الجَدِيدُ</div><div style="font-size:.7rem;color:var(--brown);margin-top:1px">New Hifdh — actively memorizing</div></div><div style="font-size:1.1rem;color:var(--gold)">✦</div></div>
-    ${nH.length?nH.map(h=>hC(h,false)).join(''):eN}
-    <button class="btn-secondary" onclick="oModal('new')">+ Add New Hifdh Entry</button>
-    <div class="deco-divider" style="margin:4px 0"><span class="deco-star">✦</span></div>
-    <div class="section-header" style="background:linear-gradient(135deg,rgba(45,106,79,.08),rgba(45,106,79,.02));border-color:rgba(45,106,79,.15)"><div style="flex:1"><div style="font-family:'Amiri',serif;font-size:1.1rem;color:var(--green)">الحِفْظُ القَرِيبُ</div><div style="font-size:.7rem;color:var(--brown);margin-top:1px">Recent Hifdh — 7-day review before main queue</div></div><div style="font-size:1.1rem;color:var(--green2)">☾</div></div>
-    ${rH2.length?rH2.map(h=>hC(h,true)).join(''):eR}
-    <button class="btn-secondary" onclick="oModal('recent')" style="border-color:var(--green2);color:var(--green2)">+ Add Recent Hifdh (already memorized)</button>
-    ${gH.length?`<div class="deco-divider" style="margin:4px 0"><span class="deco-star">✦</span></div><div class="sect-label">Graduated to Queue (${gH.length})</div>${gH.map(h=>`<div class="card" style="opacity:.7;border-color:var(--green3);padding:10px 14px"><div style="display:flex;align-items:center;gap:8px"><span style="color:var(--green2)">✓</span><span style="font-family:'Amiri',serif;font-size:1rem;color:var(--green)">${su(h.surahAr)}</span><span style="font-size:.63rem;color:var(--brown);margin-left:auto">${h.graduatedAt?.split('T')[0]||''}</span></div></div>`).join('')}`:''}
-  </div>`;
+  if(!('Notification' in window))return'';
+  return`<div class="notif-banner"><span class="notif-icon">🔔</span><div style="flex:1"><div style="font-size:.78rem;font-weight:600;color:var(--green)">Enable prayer reminders</div><div style="font-size:.65rem;color:var(--brown);margin-top:2px">Tap to allow notifications for this device</div></div><button class="notif-btn" onclick="enableNotifications()">Enable</button></div>`;
 }
 
-// ══════════════════════════════════════════════════════════
-//  NOTES
-// ══════════════════════════════════════════════════════════
-function rN() {
-  const sess=mkS(ST.queue), notes=[];
-  Object.entries(ST.sData).forEach(([key,session])=>{
-    const[iS,cS]=key.split('_'); const idx=parseInt(iS),cyc=parseInt(cS); const s=sess[idx]||[];
-    Object.entries(session.slots||{}).forEach(([slotId,slot])=>{
-      if(!slot.note?.trim()) return;
-      const si=SL.find(x=>x.id===slotId); const pages=si?.sl?s.slice(...si.sl):s; const pg=pages[0];
-      notes.push({date:slot.doneAt||session.startedAt,page:pg,surahAr:pg?gS(pg)[0]?.ar||'':'',context:`${si?.ar||slotId} · Cycle ${cyc}, S${idx+1}`,text:slot.note});
-    });
-  });
-  notes.sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));
-  const nc=notes.length===0
-    ?`<div class="card" style="text-align:center;padding:32px 20px;color:var(--brown)"><div style="font-size:2rem;margin-bottom:10px;color:var(--gold)">✎</div><div style="font-size:.9rem;margin-bottom:6px">No notes yet</div><div style="font-size:.74rem">Tap ✎ on any prayer slot to record weak spots or mutashabihat</div></div>`
-    :notes.map(n=>`<div class="card"><div style="display:flex;align-items:center;gap:7px;margin-bottom:6px">${n.surahAr?`<span style="font-family:'Amiri',serif;font-size:.95rem;color:var(--green)">${su(n.surahAr)}</span>`:''} ${n.page?`<span class="badge">p.${n.page}</span>`:''}<span style="font-size:.6rem;color:#B0A070;margin-left:auto">${n.date?.split('T')[0]||''}</span></div><div style="font-size:.65rem;color:var(--gold);margin-bottom:6px;font-family:'Amiri',serif">${n.context}</div><div style="font-size:.82rem;color:var(--sepia);line-height:1.6">${n.text}</div></div>`).join('');
-  return `<div class="view">
-    <div style="display:flex;align-items:center;justify-content:space-between">
-      <div><div style="font-family:'Amiri',serif;font-size:1.3rem;color:var(--green)">المُلَاحَظَاتْ</div><div style="color:var(--brown);font-size:.72rem;margin-top:1px">Notes · ${notes.length} recorded</div></div>
-      <div style="display:flex;gap:6px">
-        <button onclick="eNC()" style="background:var(--green);color:white;border:none;border-radius:18px;padding:6px 12px;font-size:.62rem;cursor:pointer;font-family:'Lora',serif">Notes CSV</button>
-        <button onclick="eFC()" style="background:transparent;color:var(--green);border:1px solid var(--green);border-radius:18px;padding:6px 11px;font-size:.62rem;cursor:pointer;font-family:'Lora',serif">Full CSV</button>
-      </div>
-    </div>
-    <div class="deco-divider"><span class="deco-star">✦</span></div>
-    ${nc}
-  </div>`;
-}
+// ══ DASHBOARD ══
+function rD(){const sess=mkS(ST.queue),cur=sess[ST.sessionIdx%sess.length]||[],ck=`${ST.sessionIdx}_${ST.cycle}`,csd=ST.sData[ck]||{slots:{}};const done=Object.keys(ST.sData).filter(k=>k.endsWith(`_${ST.cycle}`)&&ST.sData[k].status==='completed').length,tot=sess.length,fp=cur[0],lp=cur[cur.length-1],sS=gS(fp)[0],eS=gS(lp).slice(-1)[0];const prS=SL.filter(s=>s.id!=='tahajjud'),prD=prS.filter(s=>csd.slots?.[s.id]?.done).length,tD=csd.slots?.tahajjud?.done;const nH=ST.hifdh.filter(h=>!h.graduated&&h.category==='new'),rH=ST.hifdh.filter(h=>!h.graduated&&h.category==='recent');const bars=prS.map(s=>`<div class="${csd.slots?.[s.id]?.done?'prep-bar-done':'prep-bar-empty'}"></div>`).join('');let hs='';if(rH.length>0){const h=rH[0];const dd=Object.values(h.reviews).filter(r=>r.done).length;hs+=`<div class="card green-border"><div style="display:flex;gap:12px;align-items:center;">${ring(dd,7,68,'Days','#2D6A4F')}<div style="flex:1"><div style="font-family:'Amiri',serif;font-size:1rem;color:var(--green2);margin-bottom:3px">الحِفْظُ القَرِيبُ · Week ${h.weekNum}</div><div style="font-family:'Amiri',serif;font-size:1.2rem;color:var(--green);direction:rtl;text-align:right">${su(h.surahAr)}</div><div style="font-size:.7rem;color:var(--brown);margin-top:3px">pp. ${h.pages[0]}–${h.pages[h.pages.length-1]} · ${7-dd>0?`${7-dd} days left`:'✓ Ready!'}</div></div></div><button class="btn-secondary" onclick="setTab('hifdh')" style="margin-top:9px;font-size:.75rem">View Hifdh Tracker →</button></div>`;}if(nH.length>0){const h=nH[0];hs+=`<div class="card" style="border-color:var(--gold2)"><div style="font-family:'Amiri',serif;font-size:1rem;color:var(--gold);margin-bottom:4px">الحِفْظُ الجَدِيدُ · In Progress</div><div style="font-family:'Amiri',serif;font-size:1.2rem;color:var(--green);direction:rtl;text-align:right">${su(h.surahAr)}</div><div style="font-size:.7rem;color:var(--brown);margin-top:3px">pp. ${h.pages[0]}–${h.pages[h.pages.length-1]}</div><button class="btn-secondary" onclick="setTab('hifdh')" style="margin-top:9px;font-size:.75rem">View Hifdh Tracker →</button></div>`;}
+return`<div class="view">${notifBanner()}<div class="card" style="background:linear-gradient(160deg,#0F2A1E 0%,#1A3C2E 60%,#2D6A4F 100%);border:none;padding:18px 18px 16px;"><div style="display:flex;align-items:center;gap:16px;">${ring(done,tot,92,'Sessions','#C8921A')}<div style="color:white;flex:1;"><div style="font-family:'Amiri',serif;font-size:1rem;color:var(--gold);margin-bottom:4px">الدَّوْرَة ${ST.cycle}</div><div style="font-size:1.05rem;font-weight:600">Cycle ${ST.cycle}</div><div style="font-size:.7rem;color:rgba(255,255,255,.55);margin-top:5px">${done} completed · ${tot-done} remaining</div></div></div><div style="height:1px;background:linear-gradient(90deg,transparent,rgba(200,146,26,.4),transparent);margin:13px 0 11px;"></div><div style="font-size:.58rem;text-transform:uppercase;letter-spacing:.12em;color:var(--gold);margin-bottom:7px">Today · Session ${ST.sessionIdx+1} of ${tot}</div><div style="font-family:'Amiri',serif;font-size:1.35rem;color:white;direction:rtl;text-align:right;line-height:1.5">${su(sS?.ar||'')}${sS?.n!==eS?.n?`<span style="color:rgba(255,255,255,.4)"> ← ${su(eS?.ar||'')}</span>`:''}</div><div style="display:flex;gap:6px;margin-top:7px;flex-wrap:wrap"><span style="font-size:.62rem;padding:3px 9px;border-radius:20px;background:rgba(200,146,26,.2);color:var(--gold);border:1px solid rgba(200,146,26,.3)">الجُزْء ${gJ(fp)}</span><span style="font-size:.62rem;padding:3px 9px;border-radius:20px;background:rgba(255,255,255,.07);color:rgba(255,255,255,.6)">الحِزْب ${gH(fp)}</span><span style="font-size:.62rem;padding:3px 9px;border-radius:20px;background:rgba(255,255,255,.07);color:rgba(255,255,255,.6)">pp. ${fp}–${lp}</span></div><div style="margin-top:12px;display:flex;gap:5px;align-items:center">${bars}<div class="${tD?'tahajjud-bar-done':'tahajjud-bar-empty'}"></div></div><div style="font-size:.62rem;color:rgba(255,255,255,.4);margin-top:5px">${prD}/5 prep · ${tD?'★ Tahajjud done':'☆ Tahajjud pending'}</div><button class="btn-primary" onclick="setTab('today')">Open Today's Session →</button></div>${hs}</div>`;}
 
-// ══════════════════════════════════════════════════════════
-//  MODAL
-// ══════════════════════════════════════════════════════════
+// ══ TODAY ══
+function rT(){const sess=mkS(ST.queue),cur=sess[ST.sessionIdx%sess.length]||[],ck=`${ST.sessionIdx}_${ST.cycle}`,csd=ST.sData[ck]||{slots:{}};const fp=cur[0],lp=cur[cur.length-1],sS=gS(fp)[0],eS=gS(lp).slice(-1)[0];const cc=SL.filter(s=>csd.slots?.[s.id]?.done).length,pct=Math.round((cc/SL.length)*100);const sh=SL.map(slot=>{const pages=slot.sl?cur.slice(...slot.sl):cur;if(!pages.length)return'';const sd=csd.slots?.[slot.id]||{done:false,note:''};const iT=slot.id==='tahajjud',isE=expandedSlot===slot.id;const ss=[...new Set(pages.flatMap(p=>gS(p).map(s=>su(s.ar))))].join(' · ');const pi=iT?`Full Hizb · pp. ${fp}–${lp}`:`pp. ${pages[0]}–${pages[pages.length-1]}`;return`<div class="slot-card ${iT?'tahajjud':''} ${sd.done?'done-bg':''}"><div style="display:flex;align-items:center;gap:11px;"><button class="check-btn ${sd.done?'checked':''}" onclick="tSlot('${slot.id}')">${sd.done?'✓':''}</button><div style="flex:1;min-width:0;"><div style="display:flex;align-items:baseline;gap:7px;flex-wrap:wrap"><span style="font-family:'Amiri',serif;font-size:1.05rem;color:var(--green)">${slot.ar}</span><span style="font-size:.65rem;color:var(--brown)">${slot.en}</span>${iT?`<span style="font-size:.6rem;color:var(--gold);background:rgba(200,146,26,.1);padding:2px 7px;border-radius:10px;border:1px solid rgba(200,146,26,.3)">نِهَايَة الحِزْب</span>`:''}</div><div style="font-size:.67rem;color:var(--brown);margin-top:2px">${pi} · <span style="font-family:'Amiri',serif;font-size:.75rem">${ss}</span></div>${sd.note&&!isE?`<div style="font-size:.63rem;color:var(--gold);margin-top:3px">📝 ${sd.note.substring(0,55)}${sd.note.length>55?'…':''}</div>`:''}</div><button class="note-btn ${sd.note?'has-note':''}" onclick="tExp('${slot.id}')">✎</button></div>${isE?`<div style="margin-top:8px;padding-top:8px;border-top:1px solid #EDE8D8"><textarea class="note-area" id="note-${slot.id}" placeholder="Weak spots, mutashabihat...">${sd.note||''}</textarea><div style="display:flex;gap:7px;margin-top:6px"><button onclick="sNote('${slot.id}')" style="background:var(--green);color:white;border:none;border-radius:7px;padding:6px 14px;font-size:.72rem;cursor:pointer;font-family:'Lora',serif">Save</button>${sd.doneAt?`<span style="font-size:.6rem;color:var(--brown);align-self:center">✓ ${new Date(sd.doneAt).toLocaleString()}</span>`:''}</div></div>`:''}</div>`;}).join('');
+return`<div class="view"><div class="card" style="background:linear-gradient(160deg,#0F2A1E,#1A3C2E,#2D6A4F);border:none;"><button class="back-btn" onclick="setTab('dashboard')">← Board</button><div style="font-size:.58rem;text-transform:uppercase;letter-spacing:.12em;color:var(--gold);margin-bottom:5px">Session ${ST.sessionIdx+1} · Cycle ${ST.cycle}</div><div style="font-family:'Amiri',serif;font-size:1.4rem;color:white;direction:rtl;text-align:right;line-height:1.5">${su(sS?.ar||'')}${sS?.n!==eS?.n?`<span style="color:rgba(255,255,255,.45)"> ← ${su(eS?.ar||'')}</span>`:''}</div><div style="display:flex;gap:7px;margin-top:7px;flex-wrap:wrap"><span style="font-size:.63rem;padding:3px 9px;border-radius:20px;background:rgba(200,146,26,.2);color:var(--gold);border:1px solid rgba(200,146,26,.3)">الجُزْء ${gJ(fp)}</span><span style="font-size:.63rem;padding:3px 9px;border-radius:20px;background:rgba(255,255,255,.07);color:rgba(255,255,255,.6)">الحِزْب ${gH(fp)}</span><span style="font-size:.63rem;padding:3px 9px;border-radius:20px;background:rgba(255,255,255,.07);color:rgba(255,255,255,.6)">pp. ${fp}–${lp}</span></div><div style="margin-top:11px"><div style="display:flex;justify-content:space-between;margin-bottom:5px"><span style="font-size:.6rem;color:rgba(255,255,255,.4)">${cc}/${SL.length} completed</span><span style="font-size:.6rem;color:var(--gold)">${pct}%</span></div><div class="progress-bar-bg"><div class="progress-bar-fill" style="width:${pct}%"></div></div></div></div>${sh}<button class="btn-primary" onclick="adv('completed')">Mark Complete & Next Session →</button><button class="btn-secondary" onclick="adv('partial')">⚠ Life Happened — Mark Partial & Move On</button>${ST.sessionIdx>0?`<button onclick="goBack()" style="background:none;border:none;color:var(--brown);font-size:.72rem;cursor:pointer;text-decoration:underline;display:block;margin:4px auto 14px;padding:4px;font-family:'Lora',serif">← Previous session</button>`:'<div style="height:14px"></div>'}</div>`;}
+
+// ══ HIFDH ══
+function rH(){const nH=ST.hifdh.filter(h=>!h.graduated&&h.category==='new'),rH2=ST.hifdh.filter(h=>!h.graduated&&h.category==='recent'),gH=ST.hifdh.filter(h=>h.graduated);function hC(h,isR){const dd=Object.values(h.reviews).filter(r=>r.done).length,rdy=isR&&dd>=7;const db=isR?[1,2,3,4,5,6,7].map(d=>`<button class="day-btn ${h.reviews[d]?.done?'done':''}" onclick="tRev('${h.id}',${d})">${h.reviews[d]?.done?'✓':d}</button>`).join(''):'';return`<div class="card ${rdy?'green-border':''}"><div style="display:flex;gap:12px;align-items:flex-start">${isR?ring(dd,7,68,'Days','#2D6A4F'):''}<div style="flex:1"><div style="font-family:'Amiri',serif;font-size:1.2rem;color:var(--green);direction:rtl;text-align:right">${su(h.surahAr)}</div><div style="font-size:.7rem;color:var(--brown);margin-top:2px">${h.surahEn} · Week ${h.weekNum}</div><div style="font-size:.67rem;color:var(--brown)">Pages: ${h.pages.join(', ')}</div><div style="font-size:.65rem;color:var(--brown);margin-top:2px">${h.startDate} → ${h.endDate}</div></div></div>${!isR?`<div style="margin-top:10px">${!h.memorized?`<button class="btn-gold" onclick="mMem('${h.id}')">Mark as Memorized ✓ → Begins 7-Day Review</button>`:`<div style="display:inline-flex;align-items:center;gap:6px;background:#D4EDDA;color:#1B5E35;font-size:.68rem;padding:3px 10px;border-radius:20px;margin-top:6px">✓ Memorized</div>`}</div>`:''} ${isR?`<div style="margin-top:12px"><div class="sect-label">Daily Review</div><div style="display:flex;gap:5px;flex-wrap:wrap">${db}</div>${rdy?`<button class="btn-gold" onclick="grad('${h.id}')" style="margin-top:12px">★ Graduate to Main Queue</button>`:''}</div>`:''}</div>`;}const eN=`<div class="card" style="text-align:center;padding:22px;color:var(--brown)"><div style="font-size:1.4rem;margin-bottom:7px;color:var(--gold)">✦</div><div style="font-size:.85rem">No active new memorization</div></div>`;const eR=`<div class="card" style="text-align:center;padding:22px;color:var(--brown)"><div style="font-size:.85rem">No recent hifdh in review</div></div>`;return`<div class="view"><div class="section-header"><div style="flex:1"><div style="font-family:'Amiri',serif;font-size:1.1rem;color:var(--green)">الحِفْظُ الجَدِيدُ</div><div style="font-size:.7rem;color:var(--brown);margin-top:1px">New Hifdh — actively memorizing</div></div><div style="font-size:1.1rem;color:var(--gold)">✦</div></div>${nH.length?nH.map(h=>hC(h,false)).join(''):eN}<button class="btn-secondary" onclick="oModal('new')">+ Add New Hifdh Entry</button><div class="deco-divider" style="margin:4px 0"><span class="deco-star">✦</span></div><div class="section-header" style="background:linear-gradient(135deg,rgba(45,106,79,.08),rgba(45,106,79,.02));border-color:rgba(45,106,79,.15)"><div style="flex:1"><div style="font-family:'Amiri',serif;font-size:1.1rem;color:var(--green)">الحِفْظُ القَرِيبُ</div><div style="font-size:.7rem;color:var(--brown);margin-top:1px">Recent Hifdh — 7-day review before main queue</div></div><div style="font-size:1.1rem;color:var(--green2)">☾</div></div>${rH2.length?rH2.map(h=>hC(h,true)).join(''):eR}<button class="btn-secondary" onclick="oModal('recent')" style="border-color:var(--green2);color:var(--green2)">+ Add Recent Hifdh</button>${gH.length?`<div class="deco-divider" style="margin:4px 0"><span class="deco-star">✦</span></div><div class="sect-label">Graduated (${gH.length})</div>${gH.map(h=>`<div class="card" style="opacity:.7;border-color:var(--green3);padding:10px 14px"><div style="display:flex;align-items:center;gap:8px"><span style="color:var(--green2)">✓</span><span style="font-family:'Amiri',serif;font-size:1rem;color:var(--green)">${su(h.surahAr)}</span><span style="font-size:.63rem;color:var(--brown);margin-left:auto">${h.graduatedAt?.split('T')[0]||''}</span></div></div>`).join('')}`:''}</div>`;}
+
+// ══ NOTES ══
+function rN(){const sess=mkS(ST.queue),notes=[];Object.entries(ST.sData).forEach(([key,session])=>{const[iS,cS]=key.split('_');const idx=parseInt(iS),cyc=parseInt(cS);const s=sess[idx]||[];Object.entries(session.slots||{}).forEach(([slotId,slot])=>{if(!slot.note?.trim())return;const si=SL.find(x=>x.id===slotId);const pages=si?.sl?s.slice(...si.sl):s;const pg=pages[0];notes.push({date:slot.doneAt||session.startedAt,page:pg,surahAr:pg?gS(pg)[0]?.ar||'':'',context:`${si?.ar||slotId} · Cycle ${cyc}, S${idx+1}`,text:slot.note});});});notes.sort((a,b)=>new Date(b.date||0)-new Date(a.date||0));const nc=notes.length===0?`<div class="card" style="text-align:center;padding:32px 20px;color:var(--brown)"><div style="font-size:2rem;margin-bottom:10px;color:var(--gold)">✎</div><div style="font-size:.9rem;margin-bottom:6px">No notes yet</div><div style="font-size:.74rem">Tap ✎ on any prayer slot to record weak spots</div></div>`:notes.map(n=>`<div class="card"><div style="display:flex;align-items:center;gap:7px;margin-bottom:6px">${n.surahAr?`<span style="font-family:'Amiri',serif;font-size:.95rem;color:var(--green)">${su(n.surahAr)}</span>`:''} ${n.page?`<span class="badge">p.${n.page}</span>`:''}<span style="font-size:.6rem;color:#B0A070;margin-left:auto">${n.date?.split('T')[0]||''}</span></div><div style="font-size:.65rem;color:var(--gold);margin-bottom:6px;font-family:'Amiri',serif">${n.context}</div><div style="font-size:.82rem;color:var(--sepia);line-height:1.6">${n.text}</div></div>`).join('');return`<div class="view"><div style="display:flex;align-items:center;justify-content:space-between"><div><div style="font-family:'Amiri',serif;font-size:1.3rem;color:var(--green)">المُلَاحَظَاتْ</div><div style="color:var(--brown);font-size:.72rem;margin-top:1px">Notes · ${notes.length} recorded</div></div><div style="display:flex;gap:6px"><button onclick="eNC()" style="background:var(--green);color:white;border:none;border-radius:18px;padding:6px 12px;font-size:.62rem;cursor:pointer;font-family:'Lora',serif">Notes CSV</button><button onclick="eFC()" style="background:transparent;color:var(--green);border:1px solid var(--green);border-radius:18px;padding:6px 11px;font-size:.62rem;cursor:pointer;font-family:'Lora',serif">Full CSV</button></div></div><div class="deco-divider"><span class="deco-star">✦</span></div>${nc}</div>`;}
+
+// ══ MODAL ══
 function oModal(cat){modalCat=cat;showAddModal=true;render();}
 function cModal(){showAddModal=false;render();}
-function rModal(){
-  if(!showAddModal) return '';
-  const iN=modalCat==='new';
-  const opts=ALL_SURAHS.map(s=>`<option value="${s.n}">${s.n}. ${s.en} · ${s.ar}</option>`).join('');
-  return `<div class="modal-overlay" onclick="if(event.target===this)cModal()">
-    <div class="modal-box">
-      <div style="margin-bottom:14px">
-        <div style="font-family:'Amiri',serif;font-size:1.1rem;color:var(--green)">${iN?'الحِفْظُ الجَدِيدُ':'الحِفْظُ القَرِيبُ'}</div>
-        <div style="font-size:.7rem;color:var(--brown)">${iN?'Pages you are actively memorizing':'Pages already memorized — entering 7-day review'}</div>
-      </div>
-      <label class="lbl">Surah</label>
-      <select id="ms"><option value="">Select Surah</option>${opts}</select>
-      <label class="lbl" style="margin-top:12px">Page Numbers (comma-separated)</label>
-      <input type="text" id="mp" placeholder="e.g. 472, 473, 474"/>
-      <div style="display:flex;gap:9px;margin-top:18px">
-        <button onclick="cModal()" class="btn-secondary" style="margin-top:0">Cancel</button>
-        <button onclick="subModal()" class="btn-primary" style="margin-top:0">Add Entry</button>
-      </div>
-    </div>
-  </div>`;
-}
+function rModal(){if(!showAddModal)return'';const iN=modalCat==='new';const opts=ALL_SURAHS.map(s=>`<option value="${s.n}">${s.n}. ${s.en} · ${s.ar}</option>`).join('');return`<div class="modal-overlay" onclick="if(event.target===this)cModal()"><div class="modal-box"><div style="margin-bottom:14px"><div style="font-family:'Amiri',serif;font-size:1.1rem;color:var(--green)">${iN?'الحِفْظُ الجَدِيدُ':'الحِفْظُ القَرِيبُ'}</div><div style="font-size:.7rem;color:var(--brown)">${iN?'Pages actively memorizing':'Already memorized — 7-day review'}</div></div><label class="lbl">Surah</label><select id="ms"><option value="">Select Surah</option>${opts}</select><label class="lbl" style="margin-top:12px">Page Numbers (comma-separated)</label><input type="text" id="mp" placeholder="e.g. 472, 473, 474"/><div style="display:flex;gap:9px;margin-top:18px"><button onclick="cModal()" class="btn-secondary" style="margin-top:0">Cancel</button><button onclick="subModal()" class="btn-primary" style="margin-top:0">Add Entry</button></div></div></div>`;}
 
-// ══════════════════════════════════════════════════════════
-//  RENDER
-// ══════════════════════════════════════════════════════════
-function render() {
-  let c='';
-  if(activeTab==='dashboard') c=rD();
-  else if(activeTab==='today') c=rT();
-  else if(activeTab==='hifdh') c=rH();
-  else if(activeTab==='notes') c=rN();
-  document.getElementById('main-content').innerHTML = c + rModal();
-  document.getElementById('tab-bar').innerHTML = TABS.map(t=>
-    `<button onclick="setTab('${t.id}')" class="${activeTab===t.id?'active':''}">
-      <span class="tab-icon">${t.icon}</span>
-      <span class="tab-lbl">${t.label}</span>
-      ${activeTab===t.id?'<div class="tab-dot"></div>':'<div style="height:4px"></div>'}
-    </button>`
-  ).join('');
-}
+// ══ RENDER ══
+function render(){let c='';if(activeTab==='dashboard')c=rD();else if(activeTab==='today')c=rT();else if(activeTab==='hifdh')c=rH();else if(activeTab==='notes')c=rN();document.getElementById('main-content').innerHTML=c+rModal();document.getElementById('tab-bar').innerHTML=TABS.map(t=>`<button onclick="setTab('${t.id}')" class="${activeTab===t.id?'active':''}"><span class="tab-icon">${t.icon}</span><span class="tab-lbl">${t.label}</span>${activeTab===t.id?'<div class="tab-dot"></div>':'<div style="height:4px"></div>'}</button>`).join('');}
 
-// ══════════════════════════════════════════════════════════
-//  ACTIONS
-// ══════════════════════════════════════════════════════════
+// ══ ACTIONS ══
 function tSlot(id){setState(prev=>{const k=`${prev.sessionIdx}_${prev.cycle}`;const sd={...prev.sData};if(!sd[k])sd[k]={status:'in_progress',startedAt:new Date().toISOString(),slots:{}};const ex=sd[k].slots[id]||{done:false,note:''};sd[k]={...sd[k],slots:{...sd[k].slots,[id]:{...ex,done:!ex.done,doneAt:!ex.done?new Date().toISOString():null}}};return{...prev,sData:sd};});}
 function tExp(id){expandedSlot=expandedSlot===id?null:id;render();}
 function sNote(id){const t=document.getElementById(`note-${id}`)?.value||'';setState(prev=>{const k=`${prev.sessionIdx}_${prev.cycle}`;const sd={...prev.sData};if(!sd[k])sd[k]={status:'in_progress',startedAt:new Date().toISOString(),slots:{}};const ex=sd[k].slots[id]||{done:false};sd[k]={...sd[k],slots:{...sd[k].slots,[id]:{...ex,note:t}}};return{...prev,sData:sd};});}
@@ -539,23 +249,26 @@ function tRev(id,day){setState(prev=>({...prev,hifdh:prev.hifdh.map(h=>h.id!==id
 function mMem(id){setState(prev=>({...prev,hifdh:prev.hifdh.map(h=>h.id!==id?h:{...h,memorized:true,memorizedAt:new Date().toISOString(),category:'recent'})}));}
 function grad(id){setState(prev=>{const e=prev.hifdh.find(h=>h.id===id);if(!e)return prev;const ki=prev.queue.indexOf(293);const nq=[...prev.queue];if(ki>=0)nq.splice(ki,0,...e.pages);else nq.push(...e.pages);return{...prev,queue:nq,hifdh:prev.hifdh.map(h=>h.id!==id?h:{...h,graduated:true,graduatedAt:new Date().toISOString()})};});}
 function subModal(){const sN=parseInt(document.getElementById('ms')?.value);const pS=document.getElementById('mp')?.value||'';const s=ALL_SURAHS.find(x=>x.n===sN);if(!s||!pS.trim())return;const pages=pS.split(',').map(p=>parseInt(p.trim())).filter(p=>!isNaN(p));if(!pages.length)return;const iN=modalCat==='new';const t=new Date().toISOString().split('T')[0];setState(prev=>({...prev,hifdh:[...prev.hifdh,{id:`h-${Date.now()}`,surahAr:s.ar,surahEn:s.en,surahN:s.n,pages,weekNum:prev.hifdh.filter(h=>!h.graduated).length+1,category:modalCat,startDate:t,endDate:new Date(Date.now()+6*864e5).toISOString().split('T')[0],memorized:!iN,memorizedAt:!iN?new Date().toISOString():null,reviews:{},graduated:false,graduatedAt:null}]}));showAddModal=false;}
-
-// ══════════════════════════════════════════════════════════
-//  CSV EXPORT
-// ══════════════════════════════════════════════════════════
 function eNC(){const sess=mkS(ST.queue);const rows=[['Date','Surah','Page','Context','Note']];Object.entries(ST.sData).forEach(([key,session])=>{const[iS,cS]=key.split('_');const idx=parseInt(iS),cyc=parseInt(cS);const s=sess[idx]||[];Object.entries(session.slots||{}).forEach(([slotId,slot])=>{if(!slot.note?.trim())return;const si=SL.find(x=>x.id===slotId);const pages=si?.sl?s.slice(...si.sl):s;const pg=pages[0];rows.push([slot.doneAt?.split('T')[0]||'',pg?su(gS(pg)[0]?.ar||''):'',pg||'',`${si?.en||slotId} C${cyc}S${idx+1}`,`"${(slot.note||'').replace(/"/g,'""')}"`]);});});dlC(rows,`hifdh-notes-${TODAY}.csv`);}
-function eFC(){const sess=mkS(ST.queue);const rows=[['Session','Cycle','Pages','Status','Date','Slot','Done','Time','Note']];Object.entries(ST.sData).forEach(([key,session])=>{const[iS,cS]=key.split('_');const idx=parseInt(iS);const s=sess[idx]||[];const pages=s.length?`${s[0]}–${s[s.length-1]}`:'';Object.entries(session.slots||{}).forEach(([slotId,slot])=>{const si=SL.find(x=>x.id===slotId);rows.push([idx+1,cS,pages,session.status||'',session.startedAt?.split('T')[0]||'',si?.en||slotId,slot.done?'Yes':'No',slot.doneAt?.split('T')[1]?.split('.')[0]||'',`"${(slot.note||'').replace(/"/g,'""')}"`]);});});dlC(rows,`hifdh-full-${TODAY}.csv`);}
+function eFC(){const sess=mkS(ST.queue);const rows=[['Session','Cycle','Pages','Status','Date','Slot','Done','Note']];Object.entries(ST.sData).forEach(([key,session])=>{const[iS,cS]=key.split('_');const idx=parseInt(iS);const s=sess[idx]||[];const pages=s.length?`${s[0]}–${s[s.length-1]}`:'';Object.entries(session.slots||{}).forEach(([slotId,slot])=>{const si=SL.find(x=>x.id===slotId);rows.push([idx+1,cS,pages,session.status||'',session.startedAt?.split('T')[0]||'',si?.en||slotId,slot.done?'Yes':'No',`"${(slot.note||'').replace(/"/g,'""')}"`]);});});dlC(rows,`hifdh-full-${TODAY}.csv`);}
 function dlC(rows,fn){const a=Object.assign(document.createElement('a'),{href:URL.createObjectURL(new Blob([rows.map(r=>r.join(',')).join('\n')],{type:'text/csv'})),download:fn});a.click();}
 
-// ══════════════════════════════════════════════════════════
-//  INIT
-// ══════════════════════════════════════════════════════════
-const now = new Date();
-const hijri = toHijri(now);
-document.getElementById('hdr-greg').textContent = now.toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
-document.getElementById('hdr-hijri').textContent = `${AR_DAYS[now.getDay()]} ${hijri.d} ${HM[hijri.m-1]} ${hijri.y} هـ`;
+// ══ INIT ══
+const now=new Date();
+const hijri=toHijri(now);
+document.getElementById('hdr-greg').textContent=now.toLocaleDateString('en-GB',{weekday:'long',day:'numeric',month:'long',year:'numeric'});
+document.getElementById('hdr-hijri').textContent=`${AR_DAYS[now.getDay()]} ${hijri.d} ${HM[hijri.m-1]} ${hijri.y} هـ`;
 
-ST = loadSt() || mI();
+// Register service worker
+if('serviceWorker' in navigator){
+  window.addEventListener('load',()=>{
+    navigator.serviceWorker.register('/hifdh-tracker/service-worker.js')
+      .then(reg=>console.log('SW:',reg.scope))
+      .catch(err=>console.warn('SW error:',err));
+  });
+}
+
+ST=loadSt()||mI();
 render();
 </script>
 </body>
